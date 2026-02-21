@@ -1,0 +1,4 @@
+*.db
+*.csv
+debug_samples/
+__pycache__/
