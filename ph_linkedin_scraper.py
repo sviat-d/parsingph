@@ -122,18 +122,24 @@ def extract_product_slugs_from_leaderboard(html: str) -> set[str]:
 
     # Strategy 2: redirectToProduct or "product":{...} inside Post objects
     #   "redirectToProduct":{"__typename":"Product","id":"853410","slug":"dreamina"}
+    #   Must contain __typename":"Product" to avoid matching Topic/Category refs.
     for m in re.finditer(
-        r'"(?:redirectToProduct|product)"\s*:\s*\{[^}]*"slug"\s*:\s*"([a-z0-9][a-z0-9\-]+)"',
+        r'"(?:redirectToProduct|product)"\s*:\s*\{[^}]*?"__typename"\s*:\s*"Product"[^}]*?"slug"\s*:\s*"([a-z0-9][a-z0-9\-]+)"',
         html,
     ):
         slugs.add(m.group(1))
 
-    # Strategy 3: href="/products/{slug}" links (fallback)
+    # Strategy 3: href="/products/{slug}" links (fallback).
+    # Only match direct /products/X links, NOT /products/X/sub-pages which are
+    # navigation links.  Also skip common false positives.
+    SKIP = {"stories", "newsletter", "topics", "leaderboard", "about"}
     for m in re.finditer(
-        r'href="(?:https://www\.producthunt\.com)?/products/([a-z0-9][a-z0-9\-]+?)(?:/[^"]*)?"',
-        html, re.I,
+        r'"path"\s*:\s*"/products/([a-z0-9][a-z0-9\-]+)"',
+        html,
     ):
-        slugs.add(m.group(1).lower())
+        s = m.group(1)
+        if s not in SKIP:
+            slugs.add(s)
 
     log.debug("Extracted %d product slugs from leaderboard", len(slugs))
     return slugs
@@ -569,13 +575,13 @@ def _run_offline_tests() -> None:
         "__typename":"Product","id":"111412","slug":"n8n-io","tagline":"Workflow automation"
         "__typename":"ProductCategory","slug":"productivity","name":"Productivity"
         "__typename":"Topic","slug":"design-tools","name":"Design Tools"
-        <a href="/products/another-tool/makers">Another</a>
+        "path":"/products/another-tool"
     ''')
     slugs = extract_product_slugs_from_leaderboard(html_lb)
     check("leaderboard: lovable (Product)", "lovable" in slugs, True)
     check("leaderboard: dreamina (redirectToProduct)", "dreamina" in slugs, True)
     check("leaderboard: n8n-io (Product)", "n8n-io" in slugs, True)
-    check("leaderboard: another-tool (href fallback)", "another-tool" in slugs, True)
+    check("leaderboard: another-tool (path fallback)", "another-tool" in slugs, True)
     check("leaderboard: productivity excluded", "productivity" not in slugs, True)
     check("leaderboard: design-tools excluded", "design-tools" not in slugs, True)
 
