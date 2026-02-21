@@ -100,27 +100,42 @@ def fetch(
 
 
 def extract_product_slugs_from_leaderboard(html: str) -> set[str]:
-    """Extract product slugs from a leaderboard page HTML."""
+    """
+    Extract product slugs from a leaderboard page HTML.
+
+    PH uses Apollo SSR with __typename markers.  We only want slugs
+    from objects typed "Product", ignoring Post / Topic / ProductCategory.
+
+    Strategy 1: regex for "__typename":"Product"..."slug":"<value>"
+    Strategy 2: Post objects contain "redirectToProduct":{"__typename":"Product"..."slug":"<value>"}
+    Strategy 3: fallback — href="/products/{slug}" links
+    """
     slugs: set[str] = set()
-    SKIP = {"new", "upcoming", "topics", "stories", "newsletter", "leaderboard",
-            "products", "posts", "about", "terms", "privacy", "api"}
 
-    # href="/posts/{slug}" and href="/products/{slug}"
-    for pat in (
-        r'href="(?:https://www\.producthunt\.com)?/posts/([a-z0-9][a-z0-9\-]*)"',
-        r'href="(?:https://www\.producthunt\.com)?/products/([a-z0-9][a-z0-9\-]*?)(?:/[^"]*)?"',
+    # Strategy 1: direct Product objects
+    #   "__typename":"Product","id":"566141","name":"Lovable","slug":"lovable"
+    for m in re.finditer(
+        r'"__typename"\s*:\s*"Product"[^}]{0,300}?"slug"\s*:\s*"([a-z0-9][a-z0-9\-]+)"',
+        html,
     ):
-        for m in re.finditer(pat, html, re.I):
-            s = m.group(1).lower().rstrip("/")
-            if s not in SKIP and len(s) > 1:
-                slugs.add(s)
+        slugs.add(m.group(1))
 
-    # "slug":"value" anywhere in HTML (covers __NEXT_DATA__, RSC payloads, etc.)
-    for m in re.finditer(r'"slug"\s*:\s*"([a-z0-9][a-z0-9\-]+)"', html):
-        s = m.group(1)
-        if s not in SKIP and len(s) > 1:
-            slugs.add(s)
+    # Strategy 2: redirectToProduct or "product":{...} inside Post objects
+    #   "redirectToProduct":{"__typename":"Product","id":"853410","slug":"dreamina"}
+    for m in re.finditer(
+        r'"(?:redirectToProduct|product)"\s*:\s*\{[^}]*"slug"\s*:\s*"([a-z0-9][a-z0-9\-]+)"',
+        html,
+    ):
+        slugs.add(m.group(1))
 
+    # Strategy 3: href="/products/{slug}" links (fallback)
+    for m in re.finditer(
+        r'href="(?:https://www\.producthunt\.com)?/products/([a-z0-9][a-z0-9\-]+?)(?:/[^"]*)?"',
+        html, re.I,
+    ):
+        slugs.add(m.group(1).lower())
+
+    log.debug("Extracted %d product slugs from leaderboard", len(slugs))
     return slugs
 
 
@@ -549,18 +564,20 @@ def _run_offline_tests() -> None:
 
     # ── Test 1: extract_product_slugs_from_leaderboard ──
     html_lb = textwrap.dedent('''
-        <a href="/posts/deepseek-r1">DeepSeek</a>
-        <a href="/posts/my-cool-app">Cool App</a>
+        "__typename":"Product","id":"566141","name":"Lovable","slug":"lovable","path":"/products/lovable"
+        "__typename":"Post","id":"747034","slug":"dreamina-post","redirectToProduct":{"__typename":"Product","id":"853410","slug":"dreamina"}
+        "__typename":"Product","id":"111412","slug":"n8n-io","tagline":"Workflow automation"
+        "__typename":"ProductCategory","slug":"productivity","name":"Productivity"
+        "__typename":"Topic","slug":"design-tools","name":"Design Tools"
         <a href="/products/another-tool/makers">Another</a>
-        <script>{"slug":"hidden-gem"}</script>
-        <a href="/posts/new">not a product</a>
     ''')
     slugs = extract_product_slugs_from_leaderboard(html_lb)
-    check("leaderboard: deepseek-r1", "deepseek-r1" in slugs, True)
-    check("leaderboard: my-cool-app", "my-cool-app" in slugs, True)
-    check("leaderboard: another-tool", "another-tool" in slugs, True)
-    check("leaderboard: hidden-gem", "hidden-gem" in slugs, True)
-    check("leaderboard: 'new' excluded", "new" not in slugs, True)
+    check("leaderboard: lovable (Product)", "lovable" in slugs, True)
+    check("leaderboard: dreamina (redirectToProduct)", "dreamina" in slugs, True)
+    check("leaderboard: n8n-io (Product)", "n8n-io" in slugs, True)
+    check("leaderboard: another-tool (href fallback)", "another-tool" in slugs, True)
+    check("leaderboard: productivity excluded", "productivity" not in slugs, True)
+    check("leaderboard: design-tools excluded", "design-tools" not in slugs, True)
 
     # ── Test 2: extract_usernames_from_makers_page ──
     html_mk = textwrap.dedent('''
