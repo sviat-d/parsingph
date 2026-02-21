@@ -86,7 +86,8 @@ def fetch(
                 continue
             log.warning("HTTP %s %s — skip", r.status_code, url)
             return None
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError,
+                httpx.ProxyError) as e:
             wait = BACKOFF_BASE ** attempt + random.uniform(0, 2)
             log.warning("%s %s — retry %d/%d in %.1fs",
                         type(e).__name__, url, attempt, MAX_RETRIES, wait)
@@ -527,5 +528,106 @@ def main(argv: Optional[list[str]] = None) -> None:
 # 4. Add --include-commenters flag and a "source_type" column (maker/commenter).
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _run_offline_tests() -> None:
+    """Offline self-tests — validates parsing logic without network."""
+    import textwrap
+    ok = 0
+    fail = 0
+
+    def check(name: str, got, expected):
+        nonlocal ok, fail
+        if got == expected:
+            ok += 1
+            print(f"  PASS  {name}")
+        else:
+            fail += 1
+            print(f"  FAIL  {name}\n        got:      {got!r}\n        expected: {expected!r}")
+
+    print("=" * 60)
+    print("OFFLINE SELF-TESTS (no network)")
+    print("=" * 60)
+
+    # ── Test 1: extract_product_slugs_from_leaderboard ──
+    html_lb = textwrap.dedent('''
+        <a href="/posts/deepseek-r1">DeepSeek</a>
+        <a href="/posts/my-cool-app">Cool App</a>
+        <a href="/products/another-tool/makers">Another</a>
+        <script>{"slug":"hidden-gem"}</script>
+        <a href="/posts/new">not a product</a>
+    ''')
+    slugs = extract_product_slugs_from_leaderboard(html_lb)
+    check("leaderboard: deepseek-r1", "deepseek-r1" in slugs, True)
+    check("leaderboard: my-cool-app", "my-cool-app" in slugs, True)
+    check("leaderboard: another-tool", "another-tool" in slugs, True)
+    check("leaderboard: hidden-gem", "hidden-gem" in slugs, True)
+    check("leaderboard: 'new' excluded", "new" not in slugs, True)
+
+    # ── Test 2: extract_usernames_from_makers_page ──
+    html_mk = textwrap.dedent('''
+        <a href="/@alice">Alice</a>
+        <a href="/@Bob_42">Bob</a>
+        <script>{"username":"charlie"}</script>
+    ''')
+    users = extract_usernames_from_makers_page(html_mk)
+    check("makers: alice", "alice" in users, True)
+    check("makers: Bob_42", "Bob_42" in users, True)
+    check("makers: charlie", "charlie" in users, True)
+
+    # ── Test 3: base64 decode (clean) ──
+    raw_url = "https://www.linkedin.com/in/johndoe"
+    encoded = base64.b64encode(raw_url.encode()).decode()
+    check("b64 clean", _b64decode(encoded), raw_url)
+
+    # ── Test 4: base64 decode (with whitespace/newlines) ──
+    dirty = encoded[:20] + "\n" + encoded[20:40] + "  " + encoded[40:]
+    check("b64 with whitespace", _b64decode(dirty), raw_url)
+
+    # ── Test 5: extract_linkedin_from_user_profile — kind then encodedUrl ──
+    enc = base64.b64encode(b"https://www.linkedin.com/in/janesmith").decode()
+    html_p1 = f'{{"kind":"linkedin","encodedUrl":"{enc}","other":"x"}}'
+    check("profile: kind->encodedUrl", extract_linkedin_from_user_profile(html_p1),
+          "https://www.linkedin.com/in/janesmith")
+
+    # ── Test 6: reversed key order ──
+    html_p2 = f'{{"encodedUrl":"{enc}","kind":"linkedin"}}'
+    check("profile: encodedUrl->kind", extract_linkedin_from_user_profile(html_p2),
+          "https://www.linkedin.com/in/janesmith")
+
+    # ── Test 7: encodedUrl with escaped newlines (JSON-style \\n) ──
+    enc_nl = enc[:15] + "\\n" + enc[15:]
+    html_p3 = f'{{"kind":"linkedin","encodedUrl":"{enc_nl}"}}'
+    check("profile: b64 with \\n escape", extract_linkedin_from_user_profile(html_p3),
+          "https://www.linkedin.com/in/janesmith")
+
+    # ── Test 8: no linkedin → None ──
+    html_p4 = '{"kind":"twitter","encodedUrl":"aHR0cHM6Ly90d2l0dGVyLmNvbQ=="}'
+    check("profile: no linkedin", extract_linkedin_from_user_profile(html_p4), None)
+
+    # ── Test 9: SQLite checkpoint round-trip ──
+    import tempfile
+    tmp = tempfile.mktemp(suffix=".db")
+    db = _init_db(tmp)
+    _save_product(db, "test-slug", 2025)
+    check("db: product saved", _count_products(db, 2025), 1)
+    _save_maker(db, "testuser", "test-slug", 2025)
+    check("db: maker saved", _get_makers_for(db, "test-slug"), ["testuser"])
+    _save_linkedin(db, "testuser", "https://linkedin.com/in/test")
+    check("db: linkedin saved", _get_linkedin(db, "testuser"), "https://linkedin.com/in/test")
+    _mark_done(db, "http://example.com")
+    check("db: url done", _url_done(db, "http://example.com"), True)
+    check("db: url not done", _url_done(db, "http://other.com"), False)
+    db.close()
+    os.unlink(tmp)
+
+    print("=" * 60)
+    print(f"Results: {ok} passed, {fail} failed")
+    print("=" * 60)
+    if fail:
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    main()
+    if "--self-test" in sys.argv:
+        _run_offline_tests()
+    else:
+        main()
