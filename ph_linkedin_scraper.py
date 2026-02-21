@@ -222,6 +222,14 @@ def extract_linkedin_from_user_profile(html: str) -> Optional[str]:
             if url and "linkedin.com" in url.lower():
                 return url
 
+    # Fallback: plain LinkedIn URL anywhere in the page (rare but possible)
+    m = re.search(
+        r'(https?://(?:www\.)?linkedin\.com/in/[A-Za-z0-9_\-]+/?)',
+        html,
+    )
+    if m:
+        return m.group(1)
+
     return None
 
 
