@@ -37,6 +37,35 @@ DAILY_URL = BASE + "/leaderboard/daily/{year}/{month}/{day}"
 MAKERS_URL = BASE + "/products/{slug}/makers"
 PROFILE_URL = BASE + "/@{username}"
 
+PH_API_URL = "https://api.producthunt.com/v2/api/graphql"
+
+# GraphQL query to fetch featured posts with makers in one request
+POSTS_QUERY = """\
+query($postedAfter: DateTime!, $postedBefore: DateTime!, $first: Int!, $after: String) {
+  posts(
+    order: VOTES
+    postedAfter: $postedAfter
+    postedBefore: $postedBefore
+    first: $first
+    after: $after
+  ) {
+    edges {
+      node {
+        id
+        slug
+        name
+        votesCount
+        makers { username }
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
+"""
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -313,6 +342,112 @@ def _dates_for_year(year: int) -> list[date]:
     return out
 
 
+def step1_api(
+    client: httpx.Client, api_token: str, years: list[int], db: sqlite3.Connection,
+    *, limit: Optional[int] = None,
+) -> tuple[list[tuple[str, int]], list[tuple[str, str, int]]]:
+    """Collect products AND makers via PH GraphQL API (much faster, complete)."""
+    products: list[tuple[str, int]] = []
+    makers: list[tuple[str, str, int]] = []
+
+    api_headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    for year in years:
+        after_dt = f"{year}-01-01T00:00:00Z"
+        before_dt = f"{year}-12-31T23:59:59Z"
+        cursor: Optional[str] = None
+        page = 0
+        total = 0
+
+        pbar = tqdm(desc=f"API {year}", unit="post", disable=None)
+        while True:
+            variables: dict = {
+                "postedAfter": after_dt,
+                "postedBefore": before_dt,
+                "first": 20,
+            }
+            if cursor:
+                variables["after"] = cursor
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    r = client.post(
+                        PH_API_URL,
+                        json={"query": POSTS_QUERY, "variables": variables},
+                        headers=api_headers,
+                        timeout=30.0,
+                    )
+                    if r.status_code == 200:
+                        break
+                    if r.status_code == 429:
+                        wait = BACKOFF_BASE ** attempt + random.uniform(0, 2)
+                        log.warning("API rate limited — waiting %.0fs", wait)
+                        time.sleep(wait)
+                        continue
+                    log.error("API error %s: %s", r.status_code, r.text[:200])
+                    break
+                except (httpx.TimeoutException, httpx.ConnectError) as e:
+                    wait = BACKOFF_BASE ** attempt
+                    log.warning("%s — retry %d in %.0fs", type(e).__name__, attempt, wait)
+                    time.sleep(wait)
+            else:
+                log.error("All API retries exhausted")
+                break
+
+            if r.status_code != 200:
+                break
+
+            data = r.json()
+            edges = data.get("data", {}).get("posts", {}).get("edges", [])
+            page_info = data.get("data", {}).get("posts", {}).get("pageInfo", {})
+
+            if not edges:
+                break
+
+            for edge in edges:
+                node = edge.get("node", {})
+                slug = node.get("slug", "")
+                if not slug:
+                    continue
+
+                _save_product(db, slug, year)
+                total += 1
+                pbar.update(1)
+
+                for maker in node.get("makers", []):
+                    username = maker.get("username", "")
+                    if username:
+                        _save_maker(db, username, slug, year)
+
+                if limit and total >= limit:
+                    break
+
+            if (limit and total >= limit) or not page_info.get("hasNextPage"):
+                break
+
+            cursor = page_info.get("endCursor")
+            page += 1
+            time.sleep(0.5)  # gentle rate limit
+
+        pbar.close()
+
+        year_products = _get_products(db, year, limit)
+        products.extend(year_products)
+        log.info("Year %d via API: %d products", year, len(year_products))
+
+        # collect makers from DB for these products
+        for slug, yr in year_products:
+            for u in _get_makers_for(db, slug):
+                makers.append((u, slug, yr))
+
+    log.info("API total: %d products, %d maker entries", len(products), len(makers))
+    return products, makers
+
+
 def step1_products(
     client: httpx.Client, years: list[int], db: sqlite3.Connection,
     *, limit: Optional[int] = None, debug_dir: Optional[Path] = None,
@@ -478,6 +613,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="Max products per year (testing)")
     p.add_argument("--limit-makers-per-product", type=int, default=None,
                    help="Max makers per product (testing)")
+    p.add_argument("--api-token", default=None,
+                   help="PH API v2 Bearer token (faster, complete data). "
+                        "Get one at https://www.producthunt.com/v2/oauth/applications")
     p.add_argument("--db", default="ph_scraper_progress.db",
                    help="SQLite checkpoint file")
     p.add_argument("--debug", action="store_true",
@@ -488,6 +626,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     args = p.parse_args(argv)
     if args.year is None:
         args.year = [2025, 2026]
+    # API token can also come from environment
+    if not args.api_token:
+        args.api_token = os.environ.get("PH_API_TOKEN")
     return args
 
 
@@ -513,18 +654,28 @@ def main(argv: Optional[list[str]] = None) -> None:
     client = httpx.Client(headers=HEADERS)
 
     try:
-        log.info("STEP 1: Collecting products for %s", args.year)
-        products = step1_products(client, args.year, db,
-                                  limit=args.limit_products, debug_dir=debug_dir)
-        log.info("Products: %d", len(products))
+        if args.api_token:
+            log.info("Using PH API v2 (GraphQL) for product+maker collection")
+            log.info("STEP 1+2: Collecting products & makers via API for %s", args.year)
+            products, makers = step1_api(client, args.api_token, args.year, db,
+                                         limit=args.limit_products)
+        else:
+            log.info("STEP 1: Collecting products for %s (HTML scraping)", args.year)
+            products = step1_products(client, args.year, db,
+                                      limit=args.limit_products, debug_dir=debug_dir)
+            log.info("Products: %d", len(products))
+            if not products:
+                log.warning("No products found — exiting")
+                return
+
+            log.info("STEP 2: Collecting makers")
+            makers = step2_makers(client, products, db,
+                                  limit_per_product=args.limit_makers_per_product,
+                                  debug_dir=debug_dir)
+
         if not products:
             log.warning("No products found — exiting")
             return
-
-        log.info("STEP 2: Collecting makers")
-        makers = step2_makers(client, products, db,
-                              limit_per_product=args.limit_makers_per_product,
-                              debug_dir=debug_dir)
         if not makers:
             log.warning("No makers found — exiting")
             return
